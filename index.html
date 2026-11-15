@@ -74,6 +74,22 @@
     text-align: center; font-size: clamp(18px, 4vmin, 34px); opacity: 0.6; pointer-events: none;
   }
 
+  /* Shown when iOS refuses to restart the microphone without a tap. */
+  .resume {
+    position: absolute; left: 50%; bottom: max(18px, env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    display: none; z-index: 5;
+    padding: 12px 22px; border-radius: 999px;
+    background: var(--accent); color: #000;
+    font-weight: 700; font-size: clamp(16px, 3.4vmin, 24px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+    pointer-events: none;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .resume.show { display: block; }
+  @keyframes pulse { 50% { transform: translateX(-50%) scale(1.05); } }
+  @media (prefers-reduced-motion: reduce) { .resume { animation: none; } }
+
   .status-dot {
     position: absolute; right: max(10px, env(safe-area-inset-right)); top: max(10px, env(safe-area-inset-top));
     width: 10px; height: 10px; border-radius: 50%; background: #555; opacity: 0.7;
@@ -98,6 +114,7 @@
   }
   .panel-head { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
   .panel-head h1 { font-size: 20px; margin: 0 auto 0 0; }
+  .ver { font-size: 12px; font-weight: 400; opacity: 0.55; margin-left: 6px; }
   .btn {
     font: inherit; font-weight: 700; border: 0; border-radius: 12px;
     padding: 12px 18px; min-height: 44px; cursor: pointer;
@@ -114,6 +131,8 @@
   select { padding: 10px; border-radius: 10px; border: 1px solid #444; background: #1c1c1f; color: #fff; min-height: 44px; }
   input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 44px; }
   .note { font-size: 13px; opacity: 0.7; margin: 14px 0 0; line-height: 1.4; }
+  .tip { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: #2b2610; color: #ffe9a6; font-size: 14px; line-height: 1.4; display: none; }
+  .tip.show { display: block; }
   .msg { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: #3a1d1d; color: #ffd6d6; font-size: 14px; display: none; }
   .msg.show { display: block; }
 </style>
@@ -124,18 +143,20 @@
     <p class="caption-text" id="captionText"></p>
   </section>
   <div class="placeholder" id="placeholder">Tap to open settings, then press Start</div>
+  <div class="resume" id="resume" role="status">Tap to resume captions</div>
   <div class="status-dot" id="statusDot" aria-hidden="true"></div>
 
   <div class="panel open" id="panel" role="dialog" aria-label="Settings">
     <div class="panel-card" id="panelCard">
       <div class="panel-head">
-        <h1>Live Captions</h1>
+        <h1>Live Captions <span class="ver" id="appVersion"></span></h1>
         <button class="btn primary" id="startBtn" type="button">Start</button>
         <button class="btn" id="demoBtn" type="button">Demo</button>
         <button class="btn" id="clearBtn" type="button">Clear</button>
         <button class="btn" id="closeBtn" type="button">Hide</button>
       </div>
       <p class="msg" id="msg" role="alert"></p>
+      <p class="tip" id="fullscreenTip">For full screen: tap Share › <strong>Add to Home Screen</strong> (keep “Open as Web App” on), then always launch Captions from that icon.</p>
       <div class="grid">
         <label class="field">Lines
           <select id="optLines">
@@ -180,8 +201,14 @@
             <option value="pt-BR">Português (BR)</option>
           </select>
         </label>
+        <label class="field">When the app opens
+          <select id="optAutostart">
+            <option value="true">Start listening automatically</option>
+            <option value="false">Wait for Start</option>
+          </select>
+        </label>
       </div>
-      <p class="note">Tap anywhere on the captions to show or hide this panel. Gray words are still being recognized and may change. Keep the screen on: the app asks iOS not to sleep while listening.</p>
+      <p class="note">Tap anywhere on the captions to show or hide this panel. Gray words are still being recognized and may change. Captions keep running while this panel is open, and resume on their own after the phone wakes. If iOS won’t allow that, a “Tap to resume” button appears.</p>
     </div>
   </div>
 </main>
@@ -191,22 +218,29 @@
   'use strict';
 
   // ---------- Constants ----------
+  const APP_VERSION = 'v2';            // bump on every update so the phone shows which build is running
   const STORAGE_KEY = 'liveCaptions.settings.v1';
   const MAX_COMMITTED_CHARS = 500;     // keep the DOM tiny; only the last lines are visible anyway
-  const RESTART_DELAY_MS = 120;        // pause before restarting recognition after it ends
+  const RESTART_DELAY_MS = 120;        // pause before restarting recognition after a session ends
   const ERROR_RESTART_DELAY_MS = 1000;
+  const WATCHDOG_MS = 1000;            // how often we check that recognition is really running
+  const START_TIMEOUT_MS = 2000;       // a start that hasn't begun by now counts as failed
+  const MAX_SILENT_FAILS = 2;          // after this many failed restarts, ask for a tap
   const SILENCE_CHECK_MS = 500;
   const SCROLL_ANIM_MS = 180;
   const BOX_HEIGHT_RATIO = 0.92;       // share of the stage height captions may use
-  const DEFAULTS = Object.freeze({ lines: 3, size: 100, theme: 'dark', rotate: 'auto', clear: 8, lang: 'en-US' });
+  const DEFAULTS = Object.freeze({ lines: 3, size: 100, theme: 'dark', rotate: 'auto', clear: 8, lang: 'en-US', autostart: true });
 
   // ---------- Elements ----------
   const $ = (id) => document.getElementById(id);
   const stage = $('stage'), box = $('captionBox'), textEl = $('captionText');
-  const placeholder = $('placeholder'), dot = $('statusDot');
+  const placeholder = $('placeholder'), dot = $('statusDot'), resumeEl = $('resume');
   const panel = $('panel'), panelCard = $('panelCard'), msg = $('msg');
   const startBtn = $('startBtn'), demoBtn = $('demoBtn'), clearBtn = $('clearBtn'), closeBtn = $('closeBtn');
-  const opt = { lines: $('optLines'), size: $('optSize'), theme: $('optTheme'), rotate: $('optRotate'), clear: $('optClear'), lang: $('optLang') };
+  const opt = {
+    lines: $('optLines'), size: $('optSize'), theme: $('optTheme'), rotate: $('optRotate'),
+    clear: $('optClear'), lang: $('optLang'), autostart: $('optAutostart'),
+  };
 
   // ---------- Settings ----------
   function loadSettings() {
@@ -221,7 +255,7 @@
   let settings = loadSettings();
 
   // ---------- Transcript state ----------
-  // committed: text from earlier recognition sessions (and cleared on silence).
+  // committed: text from earlier recognition sessions.
   // sessionFinal / sessionInterim: rebuilt from scratch on every result event, which
   // avoids duplicated words when Safari re-sends the whole results list.
   let committed = '';
@@ -237,6 +271,12 @@
     const cut = s.slice(s.length - max);
     const space = cut.indexOf(' ');
     return space >= 0 ? cut.slice(space + 1) : cut;
+  }
+  function commitSession() {
+    if (!discardSession) committed = trimToTail(joinText(committed, `${sessionFinal} ${sessionInterim}`), MAX_COMMITTED_CHARS);
+    discardSession = false;
+    sessionFinal = '';
+    sessionInterim = '';
   }
 
   // ---------- Rendering ----------
@@ -290,9 +330,20 @@
   function showMessage(text) { msg.textContent = text; msg.classList.toggle('show', Boolean(text)); }
 
   // ---------- Speech recognition ----------
+  // iOS ends recognition whenever the screen sleeps, the app is backgrounded, or the
+  // audio session is interrupted. Instead of reusing one recognizer, we create a fresh
+  // one for every session and keep a watchdog that restarts it while captions are on.
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   let rec = null;
-  let running = false;
+  let running = false;        // the user wants captions on
+  let recActive = false;      // a recognition session is live right now
+  let hasStartedOnce = false; // the mic worked at least once since the app opened
+  let needsTap = false;       // iOS refused to restart without a user tap
+  let failedStarts = 0;
+  let lastLaunchAt = 0;
+  let restartTimer = null;
+
+  const isVisible = () => document.visibilityState === 'visible';
 
   function createRecognizer() {
     const r = new Recognition();
@@ -301,9 +352,18 @@
     r.maxAlternatives = 1;
     r.lang = settings.lang;
 
-    r.onstart = () => setStatus('listening');
+    r.onstart = () => {
+      if (r !== rec) return;
+      recActive = true;
+      hasStartedOnce = true;
+      failedStarts = 0;
+      hideResume();
+      showMessage('');
+      setStatus('listening');
+    };
 
     r.onresult = (e) => {
+      if (r !== rec) return;
       let fin = '', inter = '';
       for (let i = 0; i < e.results.length; i++) {
         const res = e.results[i];
@@ -317,46 +377,101 @@
     };
 
     r.onerror = (e) => {
+      if (r !== rec) return;
       if (e.error === 'no-speech' || e.error === 'aborted') return; // normal; onend restarts
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        stopListening();
-        showMessage('Microphone or speech recognition permission was denied. In iOS Settings › Safari (and Settings › Privacy › Speech Recognition), allow access, then reload.');
-        openPanel();
+        if (!hasStartedOnce && isVisible() && !needsTap && Date.now() - lastLaunchAt < START_TIMEOUT_MS && userGestureLaunch) {
+          // Denied right after the user pressed Start: a real permission problem.
+          stopListening();
+          showMessage('Microphone or speech recognition access was denied. Allow it in iOS Settings › Apps › Safari › Microphone and Settings › Privacy & Security › Speech Recognition, then reopen the app.');
+          openPanel();
+          return;
+        }
+        askForTap(); // iOS wants a fresh tap before it will reopen the mic
         return;
       }
       setStatus('error');
-      showMessage(`Speech recognition error: ${e.error}. Retrying…`);
     };
 
     r.onend = () => {
-      // Keep whatever was on screen (Safari often never marks results final).
-      if (!discardSession) committed = trimToTail(joinText(committed, `${sessionFinal} ${sessionInterim}`), MAX_COMMITTED_CHARS);
-      discardSession = false;
-      sessionFinal = '';
-      sessionInterim = '';
+      if (r !== rec) return;
+      recActive = false;
+      commitSession();
       render();
       if (!running) { setStatus(''); return; }
+      if (needsTap) return;
       setStatus('restarting');
-      const delay = dot.classList.contains('error') ? ERROR_RESTART_DELAY_MS : RESTART_DELAY_MS;
-      setTimeout(() => {
-        if (!running) return;
-        try { r.lang = settings.lang; r.start(); } catch { /* already started */ }
-      }, delay);
+      scheduleLaunch(dot.classList.contains('error') ? ERROR_RESTART_DELAY_MS : RESTART_DELAY_MS);
     };
     return r;
   }
 
-  function startListening() {
+  // Detach the current recognizer so its late events can't interfere, keeping its text.
+  function retireRecognizer() {
+    clearTimeout(restartTimer);
+    if (!rec) return;
+    const old = rec;
+    rec = null;
+    recActive = false;
+    commitSession();
+    render();
+    try { old.abort(); } catch { /* already stopped */ }
+  }
+
+  let userGestureLaunch = false;
+  function launchRecognizer(fromGesture = false) {
+    if (!running || recActive || !isVisible()) return;
+    retireRecognizer();
+    userGestureLaunch = fromGesture;
+    lastLaunchAt = Date.now();
+    rec = createRecognizer();
+    try { rec.start(); } catch { /* the watchdog will retry or ask for a tap */ }
+  }
+
+  function scheduleLaunch(delay) {
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(() => launchRecognizer(false), delay);
+  }
+
+  // Watchdog: if captions should be on but nothing is listening, restart or ask for a tap.
+  setInterval(() => {
+    if (!running || recActive || needsTap || !isVisible()) return;
+    if (Date.now() - lastLaunchAt < START_TIMEOUT_MS) return;
+    failedStarts += 1;
+    if (failedStarts > MAX_SILENT_FAILS) askForTap();
+    else launchRecognizer(false);
+  }, WATCHDOG_MS);
+
+  function askForTap() {
+    needsTap = true;
+    retireRecognizer();
+    resumeEl.textContent = hasStartedOnce ? 'Tap to resume captions' : 'Tap to start captions';
+    resumeEl.classList.add('show');
+    setStatus('error');
+  }
+  function hideResume() {
+    needsTap = false;
+    resumeEl.classList.remove('show');
+  }
+  function resumeFromTap() {
+    hideResume();
+    failedStarts = 0;
+    requestWakeLock();
+    launchRecognizer(true);
+  }
+
+  function startListening(fromGesture = true) {
     if (!Recognition) {
-      showMessage('This browser does not support speech recognition. On iPhone, use Safari (iOS 14.5 or later).');
+      showMessage('This browser does not support speech recognition. On iPhone, use Safari or a Home Screen web app.');
+      openPanel();
       return;
     }
     stopDemo();
-    if (!rec) rec = createRecognizer();
     running = true;
+    failedStarts = 0;
+    hideResume();
     showMessage('');
-    try { rec.lang = settings.lang; rec.start(); } catch { /* already started */ }
-    lastSpeechAt = Date.now();
+    launchRecognizer(fromGesture);
     requestWakeLock();
     startBtn.textContent = 'Stop';
     startBtn.classList.replace('primary', 'danger');
@@ -366,11 +481,13 @@
 
   function stopListening() {
     running = false;
-    if (rec) { try { rec.stop(); } catch { /* not running */ } }
+    retireRecognizer();
+    hideResume();
     releaseWakeLock();
     startBtn.textContent = 'Start';
     startBtn.classList.replace('danger', 'primary');
     setStatus('');
+    render();
   }
 
   function clearCaptions() {
@@ -380,10 +497,28 @@
     if (running && rec) {
       // Safari keeps re-sending the session's old words, so end the session and drop them.
       discardSession = true;
-      try { rec.abort(); } catch { /* not running */ }
+      retireRecognizer();
+      scheduleLaunch(RESTART_DELAY_MS);
     }
     render();
   }
+
+  // Sleep / background / return. iOS kills the mic when hidden, so stop cleanly and
+  // start a fresh session as soon as the app is visible again.
+  function onHidden() {
+    if (!running) return;
+    retireRecognizer();
+    setStatus('restarting');
+  }
+  function onVisible() {
+    if (!running) return;
+    failedStarts = 0;
+    requestWakeLock();
+    if (!needsTap) launchRecognizer(false);
+  }
+  document.addEventListener('visibilitychange', () => (isVisible() ? onVisible() : onHidden()));
+  window.addEventListener('pagehide', onHidden);
+  window.addEventListener('pageshow', (e) => { if (e.persisted) onVisible(); });
 
   // Fade out and clear after a stretch of silence, so stale text doesn't linger.
   setInterval(() => {
@@ -399,19 +534,15 @@
   // ---------- Keep the screen awake ----------
   let wakeLock = null;
   async function requestWakeLock() {
+    if (wakeLock || !('wakeLock' in navigator)) return;
     try {
-      if ('wakeLock' in navigator) {
-        wakeLock = await navigator.wakeLock.request('screen');
-        wakeLock.addEventListener('release', () => { wakeLock = null; });
-      }
-    } catch { /* not allowed (e.g. low power mode); captions still work */ }
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch { /* not allowed (e.g. Low Power Mode); captions still work */ }
   }
   function releaseWakeLock() {
     if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && running && !wakeLock) requestWakeLock();
-  });
 
   // ---------- Demo mode (preview the display without speaking) ----------
   const DEMO_TEXT = 'Hi, it is great to see you. Sorry, it is really loud in here. These captions show what I am saying in real time, so you can read along even when the room is noisy. Gray words are still being recognized and may change for a moment.';
@@ -425,7 +556,7 @@
     demoTimer = setInterval(() => {
       if (i >= words.length) { committed = trimToTail(joinText(committed, sessionInterim), MAX_COMMITTED_CHARS); sessionInterim = ''; stopDemo(); render(); return; }
       sessionInterim = joinText(sessionInterim, words[i++]);
-      // "Finalize" every few words, like a real recognizer does.
+      // "Finalize" at punctuation, like a real recognizer does.
       if (/[.,]$/.test(words[i - 1])) { committed = trimToTail(joinText(committed, sessionInterim), MAX_COMMITTED_CHARS); sessionInterim = ''; }
       lastSpeechAt = Date.now();
       render();
@@ -437,14 +568,22 @@
   function openPanel() { panel.classList.add('open'); }
   function closePanel() { panel.classList.remove('open'); }
 
+  // Any tap is a chance to restart the mic, since iOS trusts restarts that come from a tap.
+  function nudgeFromTap() {
+    if (needsTap) { resumeFromTap(); return true; }
+    if (running && !recActive) launchRecognizer(true);
+    return false;
+  }
+
   stage.addEventListener('click', (e) => {
     if (panelCard.contains(e.target)) return;
+    if (nudgeFromTap()) return; // a resume tap shouldn't also toggle the panel
     if (panel.classList.contains('open')) closePanel(); else openPanel();
   });
   startBtn.addEventListener('click', () => (running ? stopListening() : startListening()));
   demoBtn.addEventListener('click', startDemo);
   clearBtn.addEventListener('click', () => { stopDemo(); clearCaptions(); });
-  closeBtn.addEventListener('click', closePanel);
+  closeBtn.addEventListener('click', () => { closePanel(); nudgeFromTap(); });
 
   function applySettings() {
     document.documentElement.dataset.theme = settings.theme;
@@ -457,7 +596,7 @@
     opt[key].addEventListener('input', () => {
       settings = { ...settings, [key]: parse(opt[key].value) };
       saveSettings(settings);
-      if (key === 'lang' && running && rec) { try { rec.stop(); } catch { /* restarts with new lang */ } }
+      if (key === 'lang' && running) { retireRecognizer(); launchRecognizer(true); }
       applySettings();
     });
   }
@@ -467,13 +606,20 @@
   bindOption('rotate', String);
   bindOption('clear', Number);
   bindOption('lang', String);
+  bindOption('autostart', (v) => v === 'true');
 
   window.addEventListener('resize', layout);
   window.addEventListener('orientationchange', () => setTimeout(layout, 250));
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(layout);
 
+  // Suggest the Home Screen app when running in a normal browser tab (no full screen there).
+  const isStandalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches || window.matchMedia('(display-mode: fullscreen)').matches;
+  $('fullscreenTip').classList.toggle('show', !isStandalone);
+
+  $('appVersion').textContent = APP_VERSION;
   if (!Recognition) showMessage('Speech recognition is not available in this browser. On iPhone, open this page in Safari.');
   applySettings();
+  if (settings.autostart && Recognition) startListening(false); // no tap yet: if iOS refuses, show "Tap to start"
 })();
 </script>
 </body>
