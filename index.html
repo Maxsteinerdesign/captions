@@ -218,7 +218,7 @@
   'use strict';
 
   // ---------- Constants ----------
-  const APP_VERSION = 'v2';            // bump on every update so the phone shows which build is running
+  const APP_VERSION = 'v3';            // bump on every update so the phone shows which build is running
   const STORAGE_KEY = 'liveCaptions.settings.v1';
   const MAX_COMMITTED_CHARS = 500;     // keep the DOM tiny; only the last lines are visible anyway
   const RESTART_DELAY_MS = 120;        // pause before restarting recognition after a session ends
@@ -262,7 +262,11 @@
   let sessionFinal = '';
   let sessionInterim = '';
   let lastSpeechAt = 0;
-  let discardSession = false;
+  // Clearing the screen must NOT restart the recognizer (iOS often ignores restarts
+  // that don't come from a tap). Safari keeps re-sending the session's earlier words,
+  // so instead we remember how many words were on screen and skip them from then on.
+  let skipWords = 0;
+  let sessionWordCount = 0;
 
   const squash = (s) => s.replace(/\s+/g, ' ').trim();
   const joinText = (a, b) => squash(`${a} ${b}`);
@@ -273,10 +277,19 @@
     return space >= 0 ? cut.slice(space + 1) : cut;
   }
   function commitSession() {
-    if (!discardSession) committed = trimToTail(joinText(committed, `${sessionFinal} ${sessionInterim}`), MAX_COMMITTED_CHARS);
-    discardSession = false;
+    committed = trimToTail(joinText(committed, `${sessionFinal} ${sessionInterim}`), MAX_COMMITTED_CHARS);
     sessionFinal = '';
     sessionInterim = '';
+    skipWords = 0;
+    sessionWordCount = 0;
+  }
+  const words = (s) => squash(s).split(' ').filter(Boolean);
+  // Drop the first `skip` words across final then interim text.
+  function skipLeadingWords(fin, inter, skip) {
+    const f = words(fin), i = words(inter);
+    const fromFinal = Math.min(skip, f.length);
+    const fromInterim = Math.min(skip - fromFinal, i.length);
+    return [f.slice(fromFinal).join(' '), i.slice(fromInterim).join(' ')];
   }
 
   // ---------- Rendering ----------
@@ -370,8 +383,8 @@
         if (res.isFinal) fin += ` ${res[0].transcript}`;
         else inter += ` ${res[0].transcript}`;
       }
-      sessionFinal = squash(fin);
-      sessionInterim = squash(inter);
+      sessionWordCount = words(fin).length + words(inter).length;
+      [sessionFinal, sessionInterim] = skipLeadingWords(fin, inter, skipWords);
       lastSpeechAt = Date.now();
       render();
     };
@@ -494,12 +507,7 @@
     committed = '';
     sessionFinal = '';
     sessionInterim = '';
-    if (running && rec) {
-      // Safari keeps re-sending the session's old words, so end the session and drop them.
-      discardSession = true;
-      retireRecognizer();
-      scheduleLaunch(RESTART_DELAY_MS);
-    }
+    skipWords = sessionWordCount; // hide words already heard; the recognizer keeps running
     render();
   }
 
