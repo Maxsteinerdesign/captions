@@ -133,6 +133,11 @@
   .note { font-size: 13px; opacity: 0.7; margin: 14px 0 0; line-height: 1.4; }
   .tip { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: #2b2610; color: #ffe9a6; font-size: 14px; line-height: 1.4; display: none; }
   .tip.show { display: block; }
+  .diag { margin-top: 14px; font-size: 14px; }
+  .diag summary { cursor: pointer; min-height: 32px; opacity: 0.8; }
+  .diag pre { margin: 8px 0 0; padding: 10px; border-radius: 10px; background: #0c0c0e; color: #bfe6c4;
+              font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; max-height: 40vh; overflow: auto;
+              -webkit-user-select: text; user-select: text; }
   .msg { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: #3a1d1d; color: #ffd6d6; font-size: 14px; display: none; }
   .msg.show { display: block; }
 </style>
@@ -208,7 +213,11 @@
           </select>
         </label>
       </div>
-      <p class="note">Tap anywhere on the captions to show or hide this panel. Gray words are still being recognized and may change. Captions keep running while this panel is open, and resume on their own after the phone wakes. If iOS won’t allow that, a “Tap to resume” button appears.</p>
+      <details class="diag" id="diag">
+        <summary>Diagnostics</summary>
+        <pre id="diagLog"></pre>
+      </details>
+      <p class="note">If captions ever seem stuck, tap the screen once: that restarts the microphone. Tap anywhere on the captions to show or hide this panel. Gray words are still being recognized and may change. Captions keep running while this panel is open, and resume on their own after the phone wakes. If iOS won’t allow that, a “Tap to resume” button appears.</p>
     </div>
   </div>
 </main>
@@ -218,7 +227,7 @@
   'use strict';
 
   // ---------- Constants ----------
-  const APP_VERSION = 'v3';            // bump on every update so the phone shows which build is running
+  const APP_VERSION = 'v4';            // bump on every update so the phone shows which build is running
   const STORAGE_KEY = 'liveCaptions.settings.v1';
   const MAX_COMMITTED_CHARS = 500;     // keep the DOM tiny; only the last lines are visible anyway
   const RESTART_DELAY_MS = 120;        // pause before restarting recognition after a session ends
@@ -226,6 +235,10 @@
   const WATCHDOG_MS = 1000;            // how often we check that recognition is really running
   const START_TIMEOUT_MS = 2000;       // a start that hasn't begun by now counts as failed
   const MAX_SILENT_FAILS = 2;          // after this many failed restarts, ask for a tap
+  const STALL_MS = 6000;               // speech heard but no words for this long = stuck
+  const TAP_REFRESH_MS = 5000;         // a tap restarts the mic if no words came in this long
+  const AUTOSTART_DELAY_MS = 600;      // let iOS finish opening the app before using the mic
+  const LOG_MAX = 40;
   const SILENCE_CHECK_MS = 500;
   const SCROLL_ANIM_MS = 180;
   const BOX_HEIGHT_RATIO = 0.92;       // share of the stage height captions may use
@@ -339,6 +352,16 @@
     }
   }
 
+  // ---------- Diagnostics log (Menu › Diagnostics), so problems on the phone can be screenshotted ----------
+  const launchedAt = Date.now();
+  let logLines = [];
+  function log(message) {
+    const stamp = `${((Date.now() - launchedAt) / 1000).toFixed(1)}s`;
+    logLines = [...logLines, `${stamp}  ${message}`].slice(-LOG_MAX);
+    if ($('diag').open) $('diagLog').textContent = logLines.join('\n');
+  }
+  $('diag').addEventListener('toggle', () => { $('diagLog').textContent = logLines.join('\n'); });
+
   function setStatus(state) { dot.className = `status-dot ${state}`; }
   function showMessage(text) { msg.textContent = text; msg.classList.toggle('show', Boolean(text)); }
 
@@ -355,6 +378,10 @@
   let failedStarts = 0;
   let lastLaunchAt = 0;
   let restartTimer = null;
+  let recSeq = 0;             // numbers each recognizer in the diagnostics log
+  let lastResultAt = 0;       // when words last arrived
+  let heardSpeechAt = 0;      // when iOS last reported hearing speech
+  let stallRestarts = 0;      // automatic restarts tried since words last arrived
 
   const isVisible = () => document.visibilityState === 'visible';
 
@@ -365,7 +392,15 @@
     r.maxAlternatives = 1;
     r.lang = settings.lang;
 
+    const id = ++recSeq;
+    let gotWords = false;
+    r.onaudiostart = () => log(`#${id} mic open`);
+    r.onsoundstart = () => log(`#${id} sound heard`);
+    r.onspeechstart = () => { log(`#${id} speech heard`); if (r === rec) heardSpeechAt = Date.now(); };
+    r.onaudioend = () => log(`#${id} mic closed`);
+
     r.onstart = () => {
+      log(`#${id} started`);
       if (r !== rec) return;
       recActive = true;
       hasStartedOnce = true;
@@ -377,6 +412,8 @@
 
     r.onresult = (e) => {
       if (r !== rec) return;
+      if (!gotWords) { gotWords = true; stallRestarts = 0; log(`#${id} words arriving`); }
+      lastResultAt = Date.now();
       let fin = '', inter = '';
       for (let i = 0; i < e.results.length; i++) {
         const res = e.results[i];
@@ -390,6 +427,7 @@
     };
 
     r.onerror = (e) => {
+      log(`#${id} error: ${e.error}`);
       if (r !== rec) return;
       if (e.error === 'no-speech' || e.error === 'aborted') return; // normal; onend restarts
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
@@ -407,6 +445,7 @@
     };
 
     r.onend = () => {
+      log(`#${id} ended`);
       if (r !== rec) return;
       recActive = false;
       commitSession();
@@ -424,6 +463,7 @@
     clearTimeout(restartTimer);
     if (!rec) return;
     const old = rec;
+    log('stopping current recognizer');
     rec = null;
     recActive = false;
     commitSession();
@@ -437,8 +477,17 @@
     retireRecognizer();
     userGestureLaunch = fromGesture;
     lastLaunchAt = Date.now();
+    heardSpeechAt = 0;
     rec = createRecognizer();
-    try { rec.start(); } catch { /* the watchdog will retry or ask for a tap */ }
+    log(`#${recSeq} starting (${fromGesture ? 'after tap' : 'automatic'})`);
+    try { rec.start(); } catch (err) { log(`#${recSeq} start threw: ${err && err.name}`); }
+  }
+
+  // Throw away the current recognizer and start a fresh one from a tap.
+  function hardRestart(reason) {
+    log(`restart: ${reason}`);
+    retireRecognizer();
+    launchRecognizer(true);
   }
 
   function scheduleLaunch(delay) {
@@ -448,14 +497,32 @@
 
   // Watchdog: if captions should be on but nothing is listening, restart or ask for a tap.
   setInterval(() => {
-    if (!running || recActive || needsTap || !isVisible()) return;
-    if (Date.now() - lastLaunchAt < START_TIMEOUT_MS) return;
+    if (!running || needsTap || !isVisible()) return;
+    const now = Date.now();
+    if (recActive) {
+      // Stuck: iOS heard speech (mic is on) but no words came back.
+      if (heardSpeechAt > lastResultAt && now - heardSpeechAt > STALL_MS) {
+        // Try one automatic restart first; if that one sticks too, ask for a tap.
+        if (stallRestarts < 1) {
+          stallRestarts += 1;
+          log('stuck: heard speech but got no words, restarting');
+          retireRecognizer();
+          launchRecognizer(false);
+        } else {
+          askForTap('still stuck after automatic restart');
+        }
+      }
+      return;
+    }
+    if (now - lastLaunchAt < START_TIMEOUT_MS) return;
     failedStarts += 1;
-    if (failedStarts > MAX_SILENT_FAILS) askForTap();
+    log(`start #${recSeq} never began (${failedStarts})`);
+    if (failedStarts > MAX_SILENT_FAILS) askForTap('restarts not working');
     else launchRecognizer(false);
   }, WATCHDOG_MS);
 
-  function askForTap() {
+  function askForTap(reason = 'iOS refused restart') {
+    log(`asking for tap: ${reason}`);
     needsTap = true;
     retireRecognizer();
     resumeEl.textContent = hasStartedOnce ? 'Tap to resume captions' : 'Tap to start captions';
@@ -524,7 +591,10 @@
     requestWakeLock();
     if (!needsTap) launchRecognizer(false);
   }
-  document.addEventListener('visibilitychange', () => (isVisible() ? onVisible() : onHidden()));
+  document.addEventListener('visibilitychange', () => {
+    log(`app ${isVisible() ? 'visible' : 'hidden'}`);
+    if (isVisible()) onVisible(); else onHidden();
+  });
   window.addEventListener('pagehide', onHidden);
   window.addEventListener('pageshow', (e) => { if (e.persisted) onVisible(); });
 
@@ -577,9 +647,13 @@
   function closePanel() { panel.classList.remove('open'); }
 
   // Any tap is a chance to restart the mic, since iOS trusts restarts that come from a tap.
+  // If no words have arrived for a while, the recognizer may be stuck (mic on, no words),
+  // so a tap swaps in a fresh one. Harmless if it was merely waiting through silence.
   function nudgeFromTap() {
     if (needsTap) { resumeFromTap(); return true; }
-    if (running && !recActive) launchRecognizer(true);
+    if (!running) return false;
+    const quietFor = Date.now() - Math.max(lastResultAt, lastLaunchAt);
+    if (!recActive || quietFor > TAP_REFRESH_MS) hardRestart('tap');
     return false;
   }
 
@@ -627,7 +701,13 @@
   $('appVersion').textContent = APP_VERSION;
   if (!Recognition) showMessage('Speech recognition is not available in this browser. On iPhone, open this page in Safari.');
   applySettings();
-  if (settings.autostart && Recognition) startListening(false); // no tap yet: if iOS refuses, show "Tap to start"
+  log(`${APP_VERSION} opened ${isStandalone ? 'from Home Screen' : 'in browser'}, recognizer ${Recognition ? 'available' : 'missing'}`);
+  // No tap yet: if iOS refuses, the app shows "Tap to start". Wait until the app has fully
+  // opened first; starting the mic during launch seems to be what leaves it stuck.
+  function autostart() { setTimeout(() => { if (!running) startListening(false); }, AUTOSTART_DELAY_MS); }
+  if (settings.autostart && Recognition) {
+    if (document.readyState === 'complete') autostart(); else window.addEventListener('load', autostart, { once: true });
+  }
 })();
 </script>
 </body>
