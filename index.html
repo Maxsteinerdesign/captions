@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Captions">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Live Captions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --fg-interim: rgba(255,255,255,0.55);
+    --panel-bg: rgba(18,18,20,0.94);
+    --panel-fg: #f2f2f2;
+    --accent: #ffcc00;
+    --line-height: 1.12;
+    --stage-w: 100vw;
+    --stage-h: 100vh;
+  }
+  :root[data-theme="amber"] { --fg: #ffc400; --fg-interim: rgba(255,196,0,0.5); }
+  :root[data-theme="light"] { --bg: #fff; --fg: #000; --fg-interim: rgba(0,0,0,0.45); }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font-family: "Atkinson Hyperlegible", system-ui, -apple-system, sans-serif;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  /* The stage is the "screen" we draw on. When the phone is held sideways but
+     iOS is locked to portrait, we rotate the whole stage 90°. */
+  .stage {
+    position: fixed; top: 0; left: 0;
+    width: var(--stage-w); height: var(--stage-h);
+    padding: max(16px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+    display: flex; align-items: center; justify-content: center;
+  }
+  .stage.rot-cw  { transform-origin: top left; transform: rotate(90deg) translateY(-100%); }
+  .stage.rot-ccw { transform-origin: top left; transform: rotate(-90deg) translateX(-100%); }
+
+  .caption-box {
+    position: relative; width: 100%;
+    overflow: hidden;
+    /* height set from JS = lines × font-size × line-height */
+  }
+  .caption-text {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    margin: 0;
+    font-weight: 700;
+    line-height: var(--line-height);
+    letter-spacing: 0.01em;
+    overflow-wrap: break-word;
+    will-change: transform;
+  }
+  .caption-text .interim { color: var(--fg-interim); }
+  .caption-box.fading .caption-text { opacity: 0; transition: opacity 600ms ease; }
+
+  .placeholder {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; font-size: clamp(18px, 4vmin, 34px); opacity: 0.6; pointer-events: none;
+  }
+
+  .status-dot {
+    position: absolute; right: max(10px, env(safe-area-inset-right)); top: max(10px, env(safe-area-inset-top));
+    width: 10px; height: 10px; border-radius: 50%; background: #555; opacity: 0.7;
+  }
+  .status-dot.listening { background: #2ecc71; }
+  .status-dot.restarting { background: #f1c40f; }
+  .status-dot.error { background: #e74c3c; }
+
+  /* Settings panel */
+  .panel {
+    position: absolute; inset: 0; z-index: 10;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55);
+  }
+  .panel.open { display: flex; }
+  .panel-card {
+    width: min(760px, 100%); max-height: 100%; overflow: auto;
+    background: var(--panel-bg); color: var(--panel-fg);
+    border-radius: 18px; padding: 18px 20px;
+    font-size: 16px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  .panel-head { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .panel-head h1 { font-size: 20px; margin: 0 auto 0 0; }
+  .btn {
+    font: inherit; font-weight: 700; border: 0; border-radius: 12px;
+    padding: 12px 18px; min-height: 44px; cursor: pointer;
+    background: #2a2a2e; color: #fff;
+    transition: transform 80ms ease, background 150ms ease;
+  }
+  .btn:active { transform: scale(0.96); }
+  .btn:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .btn.primary { background: var(--accent); color: #000; }
+  .btn.danger { background: #c0392b; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 16px; }
+  label.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.9; }
+  select, input[type="range"] { font: inherit; font-size: 16px; text-transform: none; letter-spacing: 0; }
+  select { padding: 10px; border-radius: 10px; border: 1px solid #444; background: #1c1c1f; color: #fff; min-height: 44px; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 44px; }
+  .note { font-size: 13px; opacity: 0.7; margin: 14px 0 0; line-height: 1.4; }
+  .msg { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: #3a1d1d; color: #ffd6d6; font-size: 14px; display: none; }
+  .msg.show { display: block; }
+</style>
+</head>
+<body>
+<main class="stage" id="stage">
+  <section class="caption-box" id="captionBox" aria-live="polite" aria-label="Live captions">
+    <p class="caption-text" id="captionText"></p>
+  </section>
+  <div class="placeholder" id="placeholder">Tap to open settings, then press Start</div>
+  <div class="status-dot" id="statusDot" aria-hidden="true"></div>
+
+  <div class="panel open" id="panel" role="dialog" aria-label="Settings">
+    <div class="panel-card" id="panelCard">
+      <div class="panel-head">
+        <h1>Live Captions</h1>
+        <button class="btn primary" id="startBtn" type="button">Start</button>
+        <button class="btn" id="demoBtn" type="button">Demo</button>
+        <button class="btn" id="clearBtn" type="button">Clear</button>
+        <button class="btn" id="closeBtn" type="button">Hide</button>
+      </div>
+      <p class="msg" id="msg" role="alert"></p>
+      <div class="grid">
+        <label class="field">Lines
+          <select id="optLines">
+            <option value="2">2 lines</option>
+            <option value="3">3 lines</option>
+          </select>
+        </label>
+        <label class="field">Text size <span id="sizeVal"></span>
+          <input type="range" id="optSize" min="50" max="100" step="5">
+        </label>
+        <label class="field">Colors
+          <select id="optTheme">
+            <option value="dark">White on black</option>
+            <option value="amber">Amber on black</option>
+            <option value="light">Black on white</option>
+          </select>
+        </label>
+        <label class="field">Orientation
+          <select id="optRotate">
+            <option value="auto">Follow phone (rotation lock off)</option>
+            <option value="cw">Rotate clockwise</option>
+            <option value="ccw">Rotate counter-clockwise</option>
+          </select>
+        </label>
+        <label class="field">Clear after silence
+          <select id="optClear">
+            <option value="0">Never</option>
+            <option value="4">4 seconds</option>
+            <option value="8">8 seconds</option>
+            <option value="15">15 seconds</option>
+          </select>
+        </label>
+        <label class="field">Language
+          <select id="optLang">
+            <option value="en-US">English (US)</option>
+            <option value="en-GB">English (UK)</option>
+            <option value="en-AU">English (Australia)</option>
+            <option value="es-ES">Español</option>
+            <option value="fr-FR">Français</option>
+            <option value="de-DE">Deutsch</option>
+            <option value="it-IT">Italiano</option>
+            <option value="pt-BR">Português (BR)</option>
+          </select>
+        </label>
+      </div>
+      <p class="note">Tap anywhere on the captions to show or hide this panel. Gray words are still being recognized and may change. Keep the screen on: the app asks iOS not to sleep while listening.</p>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Constants ----------
+  const STORAGE_KEY = 'liveCaptions.settings.v1';
+  const MAX_COMMITTED_CHARS = 500;     // keep the DOM tiny; only the last lines are visible anyway
+  const RESTART_DELAY_MS = 120;        // pause before restarting recognition after it ends
+  const ERROR_RESTART_DELAY_MS = 1000;
+  const SILENCE_CHECK_MS = 500;
+  const SCROLL_ANIM_MS = 180;
+  const BOX_HEIGHT_RATIO = 0.92;       // share of the stage height captions may use
+  const DEFAULTS = Object.freeze({ lines: 3, size: 100, theme: 'dark', rotate: 'auto', clear: 8, lang: 'en-US' });
+
+  // ---------- Elements ----------
+  const $ = (id) => document.getElementById(id);
+  const stage = $('stage'), box = $('captionBox'), textEl = $('captionText');
+  const placeholder = $('placeholder'), dot = $('statusDot');
+  const panel = $('panel'), panelCard = $('panelCard'), msg = $('msg');
+  const startBtn = $('startBtn'), demoBtn = $('demoBtn'), clearBtn = $('clearBtn'), closeBtn = $('closeBtn');
+  const opt = { lines: $('optLines'), size: $('optSize'), theme: $('optTheme'), rotate: $('optRotate'), clear: $('optClear'), lang: $('optLang') };
+
+  // ---------- Settings ----------
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? { ...DEFAULTS, ...JSON.parse(raw) } : { ...DEFAULTS };
+    } catch { return { ...DEFAULTS }; }
+  }
+  function saveSettings(s) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch { /* storage unavailable: settings just won't persist */ }
+  }
+  let settings = loadSettings();
+
+  // ---------- Transcript state ----------
+  // committed: text from earlier recognition sessions (and cleared on silence).
+  // sessionFinal / sessionInterim: rebuilt from scratch on every result event, which
+  // avoids duplicated words when Safari re-sends the whole results list.
+  let committed = '';
+  let sessionFinal = '';
+  let sessionInterim = '';
+  let lastSpeechAt = 0;
+  let discardSession = false;
+
+  const squash = (s) => s.replace(/\s+/g, ' ').trim();
+  const joinText = (a, b) => squash(`${a} ${b}`);
+  function trimToTail(s, max) {
+    if (s.length <= max) return s;
+    const cut = s.slice(s.length - max);
+    const space = cut.indexOf(' ');
+    return space >= 0 ? cut.slice(space + 1) : cut;
+  }
+
+  // ---------- Rendering ----------
+  let fontPx = 40;
+  function layout() {
+    const portrait = window.innerHeight > window.innerWidth;
+    const rotate = settings.rotate !== 'auto' && portrait;
+    const w = rotate ? window.innerHeight : window.innerWidth;
+    const h = rotate ? window.innerWidth : window.innerHeight;
+    document.documentElement.style.setProperty('--stage-w', `${w}px`);
+    document.documentElement.style.setProperty('--stage-h', `${h}px`);
+    stage.classList.toggle('rot-cw', rotate && settings.rotate === 'cw');
+    stage.classList.toggle('rot-ccw', rotate && settings.rotate === 'ccw');
+
+    const lineHeight = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--line-height')) || 1.12;
+    const usable = (h - 32) * BOX_HEIGHT_RATIO;
+    const maxFont = usable / (settings.lines * lineHeight);
+    fontPx = Math.max(16, Math.floor(maxFont * settings.size / 100));
+    textEl.style.fontSize = `${fontPx}px`;
+    box.style.height = `${Math.ceil(fontPx * lineHeight * settings.lines)}px`;
+  }
+
+  function render() {
+    const fullFinal = joinText(committed, sessionFinal);
+    const interim = squash(sessionInterim);
+    const before = textEl.offsetHeight;
+
+    textEl.replaceChildren();
+    if (fullFinal) textEl.append(document.createTextNode(fullFinal + (interim ? ' ' : '')));
+    if (interim) {
+      const span = document.createElement('span');
+      span.className = 'interim';
+      span.textContent = interim;
+      textEl.append(span);
+    }
+    placeholder.style.display = (fullFinal || interim || running || demoTimer) ? 'none' : 'flex';
+    box.classList.remove('fading');
+
+    // Smoothly roll lines upward instead of jumping (FLIP animation).
+    const delta = textEl.offsetHeight - before;
+    if (delta > 0 && delta <= fontPx * 2.5) {
+      textEl.style.transition = 'none';
+      textEl.style.transform = `translateY(${delta}px)`;
+      void textEl.offsetHeight; // force reflow so the transition starts from the offset
+      textEl.style.transition = `transform ${SCROLL_ANIM_MS}ms ease-out`;
+      textEl.style.transform = 'translateY(0)';
+    }
+  }
+
+  function setStatus(state) { dot.className = `status-dot ${state}`; }
+  function showMessage(text) { msg.textContent = text; msg.classList.toggle('show', Boolean(text)); }
+
+  // ---------- Speech recognition ----------
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec = null;
+  let running = false;
+
+  function createRecognizer() {
+    const r = new Recognition();
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.lang = settings.lang;
+
+    r.onstart = () => setStatus('listening');
+
+    r.onresult = (e) => {
+      let fin = '', inter = '';
+      for (let i = 0; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) fin += ` ${res[0].transcript}`;
+        else inter += ` ${res[0].transcript}`;
+      }
+      sessionFinal = squash(fin);
+      sessionInterim = squash(inter);
+      lastSpeechAt = Date.now();
+      render();
+    };
+
+    r.onerror = (e) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') return; // normal; onend restarts
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        stopListening();
+        showMessage('Microphone or speech recognition permission was denied. In iOS Settings › Safari (and Settings › Privacy › Speech Recognition), allow access, then reload.');
+        openPanel();
+        return;
+      }
+      setStatus('error');
+      showMessage(`Speech recognition error: ${e.error}. Retrying…`);
+    };
+
+    r.onend = () => {
+      // Keep whatever was on screen (Safari often never marks results final).
+      if (!discardSession) committed = trimToTail(joinText(committed, `${sessionFinal} ${sessionInterim}`), MAX_COMMITTED_CHARS);
+      discardSession = false;
+      sessionFinal = '';
+      sessionInterim = '';
+      render();
+      if (!running) { setStatus(''); return; }
+      setStatus('restarting');
+      const delay = dot.classList.contains('error') ? ERROR_RESTART_DELAY_MS : RESTART_DELAY_MS;
+      setTimeout(() => {
+        if (!running) return;
+        try { r.lang = settings.lang; r.start(); } catch { /* already started */ }
+      }, delay);
+    };
+    return r;
+  }
+
+  function startListening() {
+    if (!Recognition) {
+      showMessage('This browser does not support speech recognition. On iPhone, use Safari (iOS 14.5 or later).');
+      return;
+    }
+    stopDemo();
+    if (!rec) rec = createRecognizer();
+    running = true;
+    showMessage('');
+    try { rec.lang = settings.lang; rec.start(); } catch { /* already started */ }
+    lastSpeechAt = Date.now();
+    requestWakeLock();
+    startBtn.textContent = 'Stop';
+    startBtn.classList.replace('primary', 'danger');
+    closePanel();
+    render();
+  }
+
+  function stopListening() {
+    running = false;
+    if (rec) { try { rec.stop(); } catch { /* not running */ } }
+    releaseWakeLock();
+    startBtn.textContent = 'Start';
+    startBtn.classList.replace('danger', 'primary');
+    setStatus('');
+  }
+
+  function clearCaptions() {
+    committed = '';
+    sessionFinal = '';
+    sessionInterim = '';
+    if (running && rec) {
+      // Safari keeps re-sending the session's old words, so end the session and drop them.
+      discardSession = true;
+      try { rec.abort(); } catch { /* not running */ }
+    }
+    render();
+  }
+
+  // Fade out and clear after a stretch of silence, so stale text doesn't linger.
+  setInterval(() => {
+    const seconds = Number(settings.clear);
+    if (!seconds || (!running && !demoTimer)) return;
+    const hasText = committed || sessionFinal || sessionInterim;
+    if (hasText && Date.now() - lastSpeechAt > seconds * 1000 && !box.classList.contains('fading')) {
+      box.classList.add('fading');
+      setTimeout(() => { if (box.classList.contains('fading')) clearCaptions(); }, 650);
+    }
+  }, SILENCE_CHECK_MS);
+
+  // ---------- Keep the screen awake ----------
+  let wakeLock = null;
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch { /* not allowed (e.g. low power mode); captions still work */ }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && running && !wakeLock) requestWakeLock();
+  });
+
+  // ---------- Demo mode (preview the display without speaking) ----------
+  const DEMO_TEXT = 'Hi, it is great to see you. Sorry, it is really loud in here. These captions show what I am saying in real time, so you can read along even when the room is noisy. Gray words are still being recognized and may change for a moment.';
+  let demoTimer = null;
+  function startDemo() {
+    stopListening();
+    clearCaptions();
+    const words = DEMO_TEXT.split(' ');
+    let i = 0;
+    closePanel();
+    demoTimer = setInterval(() => {
+      if (i >= words.length) { committed = trimToTail(joinText(committed, sessionInterim), MAX_COMMITTED_CHARS); sessionInterim = ''; stopDemo(); render(); return; }
+      sessionInterim = joinText(sessionInterim, words[i++]);
+      // "Finalize" every few words, like a real recognizer does.
+      if (/[.,]$/.test(words[i - 1])) { committed = trimToTail(joinText(committed, sessionInterim), MAX_COMMITTED_CHARS); sessionInterim = ''; }
+      lastSpeechAt = Date.now();
+      render();
+    }, 230);
+  }
+  function stopDemo() { if (demoTimer) { clearInterval(demoTimer); demoTimer = null; } }
+
+  // ---------- Panel & controls ----------
+  function openPanel() { panel.classList.add('open'); }
+  function closePanel() { panel.classList.remove('open'); }
+
+  stage.addEventListener('click', (e) => {
+    if (panelCard.contains(e.target)) return;
+    if (panel.classList.contains('open')) closePanel(); else openPanel();
+  });
+  startBtn.addEventListener('click', () => (running ? stopListening() : startListening()));
+  demoBtn.addEventListener('click', startDemo);
+  clearBtn.addEventListener('click', () => { stopDemo(); clearCaptions(); });
+  closeBtn.addEventListener('click', closePanel);
+
+  function applySettings() {
+    document.documentElement.dataset.theme = settings.theme;
+    $('sizeVal').textContent = `${settings.size}%`;
+    layout();
+    render();
+  }
+  function bindOption(key, parse) {
+    opt[key].value = String(settings[key]);
+    opt[key].addEventListener('input', () => {
+      settings = { ...settings, [key]: parse(opt[key].value) };
+      saveSettings(settings);
+      if (key === 'lang' && running && rec) { try { rec.stop(); } catch { /* restarts with new lang */ } }
+      applySettings();
+    });
+  }
+  bindOption('lines', Number);
+  bindOption('size', Number);
+  bindOption('theme', String);
+  bindOption('rotate', String);
+  bindOption('clear', Number);
+  bindOption('lang', String);
+
+  window.addEventListener('resize', layout);
+  window.addEventListener('orientationchange', () => setTimeout(layout, 250));
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(layout);
+
+  if (!Recognition) showMessage('Speech recognition is not available in this browser. On iPhone, open this page in Safari.');
+  applySettings();
+})();
+</script>
+</body>
+</html>
