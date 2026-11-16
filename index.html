@@ -227,7 +227,7 @@
   'use strict';
 
   // ---------- Constants ----------
-  const APP_VERSION = 'v4';            // bump on every update so the phone shows which build is running
+  const APP_VERSION = 'v5';            // bump on every update so the phone shows which build is running
   const STORAGE_KEY = 'liveCaptions.settings.v1';
   const MAX_COMMITTED_CHARS = 500;     // keep the DOM tiny; only the last lines are visible anyway
   const RESTART_DELAY_MS = 120;        // pause before restarting recognition after a session ends
@@ -235,9 +235,11 @@
   const WATCHDOG_MS = 1000;            // how often we check that recognition is really running
   const START_TIMEOUT_MS = 2000;       // a start that hasn't begun by now counts as failed
   const MAX_SILENT_FAILS = 2;          // after this many failed restarts, ask for a tap
-  const STALL_MS = 6000;               // speech heard but no words for this long = stuck
-  const TAP_REFRESH_MS = 5000;         // a tap restarts the mic if no words came in this long
-  const AUTOSTART_DELAY_MS = 600;      // let iOS finish opening the app before using the mic
+  const STALL_MS = 2500;               // speech heard but no words for this long = stuck
+  const MAX_STALL_RESTARTS = 3;        // automatic stuck-restarts before asking for a tap
+  const RETIRE_GRACE_MS = 700;         // longest we wait for iOS to release the old mic before starting anew
+  const TAP_REFRESH_MS = 3000;         // a tap restarts the mic if no words came in this long
+  const AUTOSTART_DELAY_MS = 300;      // let iOS finish opening the app before using the mic
   const LOG_MAX = 40;
   const SILENCE_CHECK_MS = 500;
   const SCROLL_ANIM_MS = 180;
@@ -358,9 +360,10 @@
   function log(message) {
     const stamp = `${((Date.now() - launchedAt) / 1000).toFixed(1)}s`;
     logLines = [...logLines, `${stamp}  ${message}`].slice(-LOG_MAX);
-    if ($('diag').open) $('diagLog').textContent = logLines.join('\n');
+    if ($('diag').open) showLog();
   }
-  $('diag').addEventListener('toggle', () => { $('diagLog').textContent = logLines.join('\n'); });
+  function showLog() { $('diagLog').textContent = [...logLines].reverse().join('\n'); } // newest first
+  $('diag').addEventListener('toggle', showLog);
 
   function setStatus(state) { dot.className = `status-dot ${state}`; }
   function showMessage(text) { msg.textContent = text; msg.classList.toggle('show', Boolean(text)); }
@@ -396,7 +399,7 @@
     let gotWords = false;
     r.onaudiostart = () => log(`#${id} mic open`);
     r.onsoundstart = () => log(`#${id} sound heard`);
-    r.onspeechstart = () => { log(`#${id} speech heard`); if (r === rec) heardSpeechAt = Date.now(); };
+    r.onspeechstart = () => { log(`#${id} speech heard`); if (r === rec && heardSpeechAt <= Math.max(lastResultAt, lastLaunchAt)) heardSpeechAt = Date.now(); };
     r.onaudioend = () => log(`#${id} mic closed`);
 
     r.onstart = () => {
@@ -446,6 +449,7 @@
 
     r.onend = () => {
       log(`#${id} ended`);
+      if (r === retiring) { finishRetire(); return; }
       if (r !== rec) return;
       recActive = false;
       commitSession();
@@ -468,15 +472,36 @@
     recActive = false;
     commitSession();
     render();
-    try { old.abort(); } catch { /* already stopped */ }
+    // iOS gets stuck (mic on, no words) if a new recognizer starts before the old one has
+    // let go of the mic, so remember it until it reports 'end' (or a short grace period passes).
+    retiring = old;
+    clearTimeout(retireTimer);
+    retireTimer = setTimeout(() => {
+      if (retiring === old) { log('old mic slow to close, starting anyway'); finishRetire(); }
+    }, RETIRE_GRACE_MS);
+    try { old.abort(); } catch { finishRetire(); }
+  }
+
+  let retiring = null;        // aborted recognizer that hasn't reported 'end' yet
+  let retireTimer = null;
+  let pendingLaunch = null;   // a launch waiting for the old recognizer to finish
+  function finishRetire() {
+    clearTimeout(retireTimer);
+    retiring = null;
+    if (!pendingLaunch) return;
+    const { fromGesture } = pendingLaunch;
+    pendingLaunch = null;
+    launchRecognizer(fromGesture);
   }
 
   let userGestureLaunch = false;
   function launchRecognizer(fromGesture = false) {
     if (!running || recActive || !isVisible()) return;
     retireRecognizer();
-    userGestureLaunch = fromGesture;
     lastLaunchAt = Date.now();
+    if (retiring) { pendingLaunch = { fromGesture }; log('waiting for old mic to close'); return; }
+    pendingLaunch = null;
+    userGestureLaunch = fromGesture;
     heardSpeechAt = 0;
     rec = createRecognizer();
     log(`#${recSeq} starting (${fromGesture ? 'after tap' : 'automatic'})`);
@@ -501,9 +526,9 @@
     const now = Date.now();
     if (recActive) {
       // Stuck: iOS heard speech (mic is on) but no words came back.
-      if (heardSpeechAt > lastResultAt && now - heardSpeechAt > STALL_MS) {
+      if (heardSpeechAt > Math.max(lastResultAt, lastLaunchAt) && now - heardSpeechAt > STALL_MS) {
         // Try one automatic restart first; if that one sticks too, ask for a tap.
-        if (stallRestarts < 1) {
+        if (stallRestarts < MAX_STALL_RESTARTS) {
           stallRestarts += 1;
           log('stuck: heard speech but got no words, restarting');
           retireRecognizer();
@@ -514,7 +539,7 @@
       }
       return;
     }
-    if (now - lastLaunchAt < START_TIMEOUT_MS) return;
+    if (pendingLaunch || now - lastLaunchAt < START_TIMEOUT_MS) return;
     failedStarts += 1;
     log(`start #${recSeq} never began (${failedStarts})`);
     if (failedStarts > MAX_SILENT_FAILS) askForTap('restarts not working');
@@ -561,6 +586,7 @@
 
   function stopListening() {
     running = false;
+    pendingLaunch = null;
     retireRecognizer();
     hideResume();
     releaseWakeLock();
